@@ -37,6 +37,10 @@ pub enum Token<'a> {
     WHILE,
     FOR,
     DO,
+
+    PUB,
+    IMPORT,
+    USE,
 }
 
 static KEYWORDS: OnceLock<HashMap<&'static str, Token<'static>>> = OnceLock::new();
@@ -57,6 +61,9 @@ fn keywords() -> &'static HashMap<&'static str, Token<'static>> {
         map.insert("do", Token::DO);
         map.insert("end", Token::END);
         map.insert("in", Token::IN);
+        map.insert("pub", Token::PUB);
+        map.insert("import", Token::IMPORT);
+        map.insert("use", Token::USE);
         map
     })
 }
@@ -100,14 +107,26 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
         }
         if char.is_alphabetic() {
             let mut identifier = String::from(char);
+
             while let Some(&next_char) = chars.peek() {
                 if next_char.is_alphanumeric() || next_char == '_' {
                     identifier.push(chars.next().unwrap());
+                } else if next_char == ':' {
+                    // check for '::'
+                    let mut clone_iter = chars.clone();
+                    clone_iter.next(); // skip first ':'
+                    if clone_iter.next() == Some(':') {
+                        chars.next(); // consume first ':'
+                        chars.next(); // consume second ':'
+                        identifier.push_str("::");
+                    } else {
+                        break;
+                    }
                 } else {
                     break;
                 }
             }
-            
+
             // Check if the identifier is a keyword
             if let Some(keyword_token) = keywords.get(identifier.as_str()) {
                 tokens.push(keyword_token.clone());

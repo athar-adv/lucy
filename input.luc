@@ -1,0 +1,25 @@
+# input.luc
+
+import module "./module.luc"
+
+use module {add, hi}
+
+pub Var: mut u8 = 10
+pub STRING_CONSTANT = "hello world"
+
+pub function sub(a: u8, b: u8)
+{
+    return a - b
+}
+
+function main()
+{
+    let fool: module::MyStruct = module::MyStruct {
+        hi: 10
+    }
+    let v: u8 = add(hi, 12)
+    print(v)
+    print(fool.hi)
+}
+
+

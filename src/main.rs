@@ -7,9 +7,10 @@ mod vm;
 mod v_type;
 
 use lexer::tokenize;
-use ast::parse;
-use compiler::{compile_stmt, RegAlloc, CompileCtx};
+use ast::{parse, Parser};
+use compiler::{compile_stmt, resolve_import_exports, RegAlloc, CompileCtx};
 use vm::{RuntimeValue, VM};
+use std::collections::HashMap;
 
 use std::fs;
 use std::env;
@@ -19,8 +20,73 @@ use std::process;
 use crate::compiler::pack_i_abx;
 use crate::compiler::ConstValue;
 use crate::compiler::Opcode;
+use crate::compiler::TypeResolver;
 use crate::v_type::VType;
 use crate::vm::NativeFunction;
+
+fn main() {
+    use std::{fs, process};
+    let mut args = env::args();
+    args.next(); // Skip program name
+    
+    let path = args.next().unwrap();
+
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) => {
+            eprintln!("Error reading file '{}': {}", &path, e);
+            process::exit(1);
+        }
+    };
+
+    let tokens = tokenize(contents);
+
+    let mut parser = Parser::new(tokens);
+    let mut ast = parser.parse().unwrap();
+
+    // let mut loaded_modules_structs: HashMap<String, HashMap<String, VType>> = HashMap::new();
+
+    // let resolver = TypeResolver {
+    //     local_structs: &parser.defined_struct_types,
+    //     imported_structs: &loaded_modules_structs,
+    // };
+
+    // resolver.resolve_node(&mut ast).unwrap();
+
+    println!("{:#?}", ast);
+    
+    let mut ctx = CompileCtx::new();
+    let native_fns: Vec<NativeFunction> = vec![
+        NativeFunction {
+            name: "print".into(),
+            func: |args| {
+                println!("{:?}", args[0]);
+                RuntimeValue::Empty
+            }
+        }
+    ];
+    
+    ctx.register_native_fns(&native_fns);
+
+    resolve_import_exports(&mut ast, &mut ctx, |path| {
+        std::fs::read_to_string(path).map_err(|e| e.to_string())
+    }).unwrap();
+
+    let mut code = vec![];
+
+    // Emit module-level constant loads first
+    code.extend(ctx.init_code.clone());
+
+    // Then compile the rest of the program
+    compile_stmt(ast, &mut ctx, &mut code);
+    
+    dump_protos(&ctx);
+    let main_proto_index = ctx.find_fn_addr_by_name("main")
+        .expect("main function not found");
+
+    let mut vm = VM::new(native_fns, ctx.protos.clone(), ctx.structs, ctx.consts);
+    vm.run_from_proto(main_proto_index);
+}
 
 fn decode_instruction_abx(instr: u32) -> (u32, usize, usize) {
     let opcode = instr & 0b111111;
@@ -188,44 +254,4 @@ fn dump_protos(ctx: &CompileCtx) {
             }
         }
     }
-}
-
-fn main() {
-    use std::{fs, process};
-    let mut args = env::args();
-    let path = args.next().unwrap();
-
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(e) => {
-            eprintln!("Error reading file '{}': {}", &path, e);
-            process::exit(1);
-        }
-    };
-
-    let tokens = tokenize(contents);
-    let ast = parse(tokens).unwrap();
-    println!("{:#?}", ast);
-    
-    let mut ctx = CompileCtx::new();
-    let native_fns: Vec<NativeFunction> = vec![
-        NativeFunction {
-            name: "print".into(),
-            func: |args| {
-                println!("{:?}", args[0]);
-                RuntimeValue::Empty
-            }
-        }
-    ];
-    
-    ctx.register_native_fns(&native_fns);
-    
-    let mut code = Vec::new();
-    compile_stmt(ast, &mut ctx, &mut code);
-    dump_protos(&ctx);
-    let main_proto_index = ctx.find_fn_addr_by_name("main")
-        .expect("main function not found");
-
-    let mut vm = VM::new(native_fns, ctx.protos.clone(), ctx.structs, ctx.consts);
-    vm.run_from_proto(main_proto_index);
 }

@@ -23,6 +23,9 @@ pub enum RuntimeValue {
     F32(f32),
     F64(f64),
 
+    U64(u64),
+    I64(i64),
+
     Str(String),
     USize(usize),
     Bool(bool),
@@ -40,7 +43,7 @@ pub enum RuntimeValue {
 #[derive(Debug, Clone)]
 pub struct StructInstance {
     struct_idx: usize,
-    concrete_type: Vec<VType>, // 🔥 THIS
+    concrete_type: Vec<VType>,
     fields: Vec<RuntimeValue>,
 }
 
@@ -118,22 +121,27 @@ fn can_cast_type(from: &VType, to: &VType) -> bool {
     }
 
     match (from, to) {
-        (VType::U8, VType::U16 | VType::U32 | VType::I32 | VType::I16 | VType::USize | VType::F32 | VType::F64) => true,
-        (VType::U16, VType::U32 | VType::I32 | VType::USize | VType::F32 | VType::F64 | VType::U8 | VType::I16) => true,
-        (VType::U32, VType::USize | VType::F32 | VType::F64 | VType::I32 | VType::U8 | VType::U16 | VType::I16) => true,
+        // ── unsigned widening / narrowing ─────────────────────────────
+        (VType::U8,  VType::U16 | VType::U32 | VType::U64 | VType::I16 | VType::I32 | VType::I64 | VType::USize | VType::F32 | VType::F64) => true,
+        (VType::U16, VType::U32 | VType::U64 | VType::I32 | VType::I64 | VType::USize | VType::F32 | VType::F64 | VType::U8 | VType::I16) => true,
+        (VType::U32, VType::U64 | VType::I32 | VType::I64 | VType::USize | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::I16) => true,
+        (VType::U64, VType::F32 | VType::F64 | VType::USize | VType::I64) => true,
 
-        (VType::I8, VType::I16 | VType::I32 | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32) => true,
-        (VType::I16, VType::I32 | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32 | VType::I8) => true,
-        (VType::I32, VType::I8 | VType::I16 | VType::U8 | VType::U16 | VType::U32 | VType::F32 | VType::F64 | VType::USize) => true,
+        // ── signed widening / narrowing ───────────────────────────────
+        (VType::I8,  VType::I16 | VType::I32 | VType::I64 | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32 | VType::U64) => true,
+        (VType::I16, VType::I32 | VType::I64 | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32 | VType::U64 | VType::I8) => true,
+        (VType::I32, VType::I64 | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32 | VType::U64 | VType::I8 | VType::I16) => true,
+        (VType::I64, VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32 | VType::U64 | VType::I8 | VType::I16 | VType::I32) => true,
 
-        (VType::F32, VType::F64 | VType::I32 | VType::U32 | VType::I8 | VType::U8 | VType::USize) => true,
-        (VType::F64, VType::F32 | VType::I32 | VType::U32 | VType::I8 | VType::U8 | VType::USize) => true,
+        // ── floats ────────────────────────────────────────────────────
+        (VType::F32, VType::F64 | VType::I32 | VType::U32 | VType::I64 | VType::U64 | VType::I8 | VType::U8 | VType::USize) => true,
+        (VType::F64, VType::F32 | VType::I32 | VType::U32 | VType::I64 | VType::U64 | VType::I8 | VType::U8 | VType::USize) => true,
 
-        (VType::USize, VType::I32 | VType::U32 | VType::U8 | VType::U16 | VType::F32 | VType::F64) => true,
+        (VType::USize, VType::I32 | VType::U32 | VType::U64 | VType::F32 | VType::F64 | VType::U8 | VType::U16) => true,
+
+        // ── arrays / structs ─────────────────────────────────────────
         (VType::Array(a), VType::Array(b)) => can_cast_type(a, b),
-        (VType::Struct(n1, g1), VType::Struct(n2, g2)) => {
-            n1 == n2 && g1 == g2
-        }
+        (VType::Struct(n1, g1), VType::Struct(n2, g2)) => n1 == n2 && g1 == g2,
 
         _ => false,
     }
@@ -167,6 +175,8 @@ fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
         (RuntimeValue::U32(n),  VType::U32)   => RuntimeValue::U32(n),
         (RuntimeValue::F32(n),  VType::F32)   => RuntimeValue::F32(n),
         (RuntimeValue::F64(n),  VType::F64)   => RuntimeValue::F64(n),
+        (RuntimeValue::U64(n),  VType::U64)   => RuntimeValue::U64(n),
+        (RuntimeValue::I64(n),  VType::I64)   => RuntimeValue::I64(n),
         (RuntimeValue::USize(n),VType::USize) => RuntimeValue::USize(n),
 
         // ── unsigned widening / narrowing ─────────────────────────────────────
@@ -177,6 +187,8 @@ fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
         (RuntimeValue::U8(n),  VType::USize)=> RuntimeValue::USize(n as usize),
         (RuntimeValue::U8(n),  VType::F32)  => RuntimeValue::F32(n as f32),
         (RuntimeValue::U8(n),  VType::F64)  => RuntimeValue::F64(n as f64),
+        (RuntimeValue::U8(n),  VType::U64)   => RuntimeValue::U64(n as u64),
+        (RuntimeValue::U8(n),  VType::I64)   => RuntimeValue::I64(n as i64),
 
         (RuntimeValue::U16(n), VType::U32)  => RuntimeValue::U32(n as u32),
         (RuntimeValue::U16(n), VType::I32)  => RuntimeValue::I32(n as i32),
@@ -185,6 +197,8 @@ fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
         (RuntimeValue::U16(n), VType::F64)  => RuntimeValue::F64(n as f64),
         (RuntimeValue::U16(n), VType::U8)   => RuntimeValue::U8(n as u8),   // narrowing
         (RuntimeValue::U16(n), VType::I16)  => RuntimeValue::I16(n as i16),
+        (RuntimeValue::U16(n),  VType::U64)   => RuntimeValue::U64(n as u64),
+        (RuntimeValue::U16(n),  VType::I64)   => RuntimeValue::I64(n as i64),
 
         (RuntimeValue::U32(n), VType::USize)=> RuntimeValue::USize(n as usize),
         (RuntimeValue::U32(n), VType::F32)  => RuntimeValue::F32(n as f32),
@@ -193,6 +207,16 @@ fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
         (RuntimeValue::U32(n), VType::U8)   => RuntimeValue::U8(n as u8),
         (RuntimeValue::U32(n), VType::U16)  => RuntimeValue::U16(n as u16),
         (RuntimeValue::U32(n), VType::I16)  => RuntimeValue::I16(n as i16),
+        (RuntimeValue::U32(n),  VType::U64)   => RuntimeValue::U64(n as u64),
+        (RuntimeValue::U32(n),  VType::I64)   => RuntimeValue::I64(n as i64),
+
+        (RuntimeValue::U8(n),  VType::U64) => RuntimeValue::U64(n as u64),
+        (RuntimeValue::U16(n), VType::U64) => RuntimeValue::U64(n as u64),
+        (RuntimeValue::U32(n), VType::U64) => RuntimeValue::U64(n as u64),
+        (RuntimeValue::U64(n), VType::USize) => RuntimeValue::USize(n as usize),
+        (RuntimeValue::U64(n), VType::F32)   => RuntimeValue::F32(n as f32),
+        (RuntimeValue::U64(n), VType::F64)   => RuntimeValue::F64(n as f64),
+        (RuntimeValue::U64(n), VType::I64)   => RuntimeValue::I64(n as i64),
 
         // ── signed widening / narrowing ───────────────────────────────────────
         (RuntimeValue::I8(n),  VType::I16)  => RuntimeValue::I16(n as i16),
@@ -202,6 +226,8 @@ fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
         (RuntimeValue::I8(n),  VType::U8)   => RuntimeValue::U8(n as u8),
         (RuntimeValue::I8(n),  VType::U16)  => RuntimeValue::U16(n as u16),
         (RuntimeValue::I8(n),  VType::U32)  => RuntimeValue::U32(n as u32),
+        (RuntimeValue::I8(n),  VType::U64)   => RuntimeValue::U64(n as u64),
+        (RuntimeValue::I8(n),  VType::I64)   => RuntimeValue::I64(n as i64),
 
         (RuntimeValue::I16(n), VType::I32)  => RuntimeValue::I32(n as i32),
         (RuntimeValue::I16(n), VType::F32)  => RuntimeValue::F32(n as f32),
@@ -210,6 +236,8 @@ fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
         (RuntimeValue::I16(n), VType::U16)  => RuntimeValue::U16(n as u16),
         (RuntimeValue::I16(n), VType::U32)  => RuntimeValue::U32(n as u32),
         (RuntimeValue::I16(n), VType::I8)   => RuntimeValue::I8(n as i8),
+        (RuntimeValue::I16(n),  VType::U64)   => RuntimeValue::U64(n as u64),
+        (RuntimeValue::I16(n),  VType::I64)   => RuntimeValue::I64(n as i64),
 
         (RuntimeValue::I32(n), VType::I8)   => RuntimeValue::I8(n as i8),
         (RuntimeValue::I32(n), VType::I16)  => RuntimeValue::I16(n as i16),
@@ -219,6 +247,17 @@ fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
         (RuntimeValue::I32(n), VType::F32)  => RuntimeValue::F32(n as f32),
         (RuntimeValue::I32(n), VType::F64)  => RuntimeValue::F64(n as f64),
         (RuntimeValue::I32(n), VType::USize)=> RuntimeValue::USize(n as usize),
+        (RuntimeValue::I32(n),  VType::U64)   => RuntimeValue::U64(n as u64),
+        (RuntimeValue::I32(n),  VType::I64)   => RuntimeValue::I64(n as i64),
+
+        (RuntimeValue::I8(n),  VType::I64) => RuntimeValue::I64(n as i64),
+        (RuntimeValue::I16(n), VType::I64) => RuntimeValue::I64(n as i64),
+        (RuntimeValue::I32(n), VType::I64) => RuntimeValue::I64(n as i64),
+        (RuntimeValue::I64(n), VType::F32) => RuntimeValue::F32(n as f32),
+        (RuntimeValue::I64(n), VType::F64) => RuntimeValue::F64(n as f64),
+        (RuntimeValue::I64(n), VType::I32) => RuntimeValue::I32(n as i32),
+        (RuntimeValue::I64(n), VType::U32) => RuntimeValue::U32(n as u32),
+        (RuntimeValue::I64(n), VType::U64) => RuntimeValue::U64(n as u64),
 
         // ── float conversions ─────────────────────────────────────────────────
         (RuntimeValue::F32(n), VType::F64)  => RuntimeValue::F64(n as f64),
@@ -227,6 +266,8 @@ fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
         (RuntimeValue::F32(n), VType::I8)   => RuntimeValue::I8(n as i8),
         (RuntimeValue::F32(n), VType::U8)   => RuntimeValue::U8(n as u8),
         (RuntimeValue::F32(n), VType::USize)=> RuntimeValue::USize(n as usize),
+        (RuntimeValue::F32(n),  VType::U64)   => RuntimeValue::U64(n as u64),
+        (RuntimeValue::F32(n),  VType::I64)   => RuntimeValue::I64(n as i64),
 
         (RuntimeValue::F64(n), VType::F32)  => RuntimeValue::F32(n as f32),
         (RuntimeValue::F64(n), VType::I32)  => RuntimeValue::I32(n as i32),
@@ -234,6 +275,8 @@ fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
         (RuntimeValue::F64(n), VType::I8)   => RuntimeValue::I8(n as i8),
         (RuntimeValue::F64(n), VType::U8)   => RuntimeValue::U8(n as u8),
         (RuntimeValue::F64(n), VType::USize)=> RuntimeValue::USize(n as usize),
+        (RuntimeValue::F64(n),  VType::U64)   => RuntimeValue::U64(n as u64),
+        (RuntimeValue::F64(n),  VType::I64)   => RuntimeValue::I64(n as i64),
 
         // ── usize ─────────────────────────────────────────────────────────────
         (RuntimeValue::USize(n), VType::I32)  => RuntimeValue::I32(n as i32),
@@ -242,6 +285,8 @@ fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
         (RuntimeValue::USize(n), VType::U16)  => RuntimeValue::U16(n as u16),
         (RuntimeValue::USize(n), VType::F32)  => RuntimeValue::F32(n as f32),
         (RuntimeValue::USize(n), VType::F64)  => RuntimeValue::F64(n as f64),
+        (RuntimeValue::USize(n),  VType::U64)   => RuntimeValue::U64(n as u64),
+        (RuntimeValue::USize(n),  VType::I64)   => RuntimeValue::I64(n as i64),
 
         (RuntimeValue::Str(v), VType::String) => RuntimeValue::Str(v),
         
@@ -391,7 +436,16 @@ impl VM {
                             .expect(&format!("LoadConst: OOB bx={} proto={}", bx, frame.proto_index));
                         
                         frame.regs[a] = match const_val {
+                            CV::U8(n) => RuntimeValue::U8(n),
+                            CV::I8(n) => RuntimeValue::I8(n),
+                            CV::U16(n) => RuntimeValue::U16(n),
+                            CV::I16(n) => RuntimeValue::I16(n),
+                            CV::U32(n) => RuntimeValue::U32(n),
                             CV::I32(n) => RuntimeValue::I32(n),
+                            CV::U64(n) => RuntimeValue::U64(n),
+                            CV::I64(n) => RuntimeValue::I64(n),
+                            CV::F32(n) => RuntimeValue::F32(n),
+                            CV::F64(n) => RuntimeValue::F64(n),
                             CV::Bool(b) => RuntimeValue::Bool(b),
                             CV::Empty => RuntimeValue::Empty,
                             CV::USize(n) => RuntimeValue::USize(n),
@@ -409,7 +463,10 @@ impl VM {
                             .expect(&format!("NewStruct: OOB bx={}", bx));
 
                         if let ConstValue::StructInst(struct_idx, concrete_type) = const_val {
-                            let struct_proto_idx = self.struct_protos.len() - (struct_idx - 1);
+                            let struct_proto_idx = self.struct_protos.len() - (
+                                if struct_idx == 0 {1}
+                                else {struct_idx - 1}
+                            );
                             let struct_proto = &self.struct_protos[struct_proto_idx];
 
                             let instance = StructInstance {
@@ -445,7 +502,11 @@ impl VM {
                             _ => panic!("StoreStructField: not a struct"),
                         };
 
-                        let struct_proto_idx = self.struct_protos.len() - (s.struct_idx - 1);
+                        let struct_idx = s.struct_idx;
+                        let struct_proto_idx = self.struct_protos.len() - (
+                            if struct_idx == 0 {1}
+                            else {struct_idx - 1}
+                        );
                         let struct_proto = &self.struct_protos[struct_proto_idx];
                         let (_, proto_ty) = &struct_proto.fields[b];
 

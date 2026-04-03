@@ -39,6 +39,18 @@ pub enum AstNode {
         assignee: Box<AstNode>,
         value: Box<AstNode>,
     },
+    // Module system
+    Export {
+        item: Box<AstNode>,  // wraps Function, StructDecl, or Declaration
+    },
+    Import {
+        alias: String,       // "module" in: import module "./path.luc"
+        path: String,        // "./module.luc"
+    },
+    Use {
+        module_alias: String,         // "module" in: use module::(...)
+        items: Vec<String>,           // ["MyStruct", "add"]
+    },
 
     // Operations
     BinaryOp {
@@ -110,7 +122,7 @@ pub enum AstNode {
 }
 
 pub struct Parser {
-    defined_struct_types: HashMap<String, VType>,
+    pub defined_struct_types: HashMap<String, VType>,
     tokens: Peekable<IntoIter<Token<'static>>>,
     generic_stack: Vec<Vec<String>>,
 }
@@ -167,6 +179,19 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<AstNode, String> {
         match peek(&mut self.tokens) {
+            // In parse_statement, add at the top of the match:
+            Some(Token::PUB) => {
+                consume(&mut self.tokens);
+                self.parse_export()
+            }
+            Some(Token::IMPORT) => {
+                consume(&mut self.tokens);
+                self.parse_import()
+            }
+            Some(Token::USE) => {
+                consume(&mut self.tokens);
+                self.parse_use()
+            }
             Some(Token::DECLARE) => {
                 consume(&mut self.tokens);
                 self.parse_declaration()
@@ -203,6 +228,87 @@ impl Parser {
             }
             _ => self.parse_expression(),
         }
+    }
+
+    fn parse_export(&mut self) -> Result<AstNode, String> {
+        // `pub` has already been consumed
+        // The next token tells us what kind of item is being exported
+        let item = match peek(&mut self.tokens) {
+            Some(Token::FN) => {
+                consume(&mut self.tokens);
+                self.parse_function()?
+            }
+            Some(Token::STRUCT) => {
+                consume(&mut self.tokens);
+                self.parse_struct_declaration()?
+            }
+            Some(Token::DECLARE) => {
+                consume(&mut self.tokens);
+                self.parse_declaration()?
+            }
+            // Bare `pub MyVar: u8 = 10` — treat like a declaration without `let`
+            Some(Token::IDENT(_)) => {
+                self.parse_declaration()?
+            }
+            _ => return Err("Expected 'fn', 'struct', 'let', or identifier after 'pub'".into()),
+        };
+
+        Ok(AstNode::Export {
+            item: Box::new(item),
+        })
+    }
+
+    fn parse_import(&mut self) -> Result<AstNode, String> {
+        // Syntax: import <alias> "<path>"
+        // `import` already consumed
+
+        let alias = match consume(&mut self.tokens) {
+            Some(Token::IDENT(name)) => name.to_string(),
+            _ => return Err("Expected module alias after 'import'".into()),
+        };
+
+        let path = match consume(&mut self.tokens) {
+            Some(Token::STRING(s)) => s.to_string(),
+            _ => return Err("Expected string path after module alias in 'import'".into()),
+        };
+
+        Ok(AstNode::Import { alias, path })
+    }
+
+    fn parse_use(&mut self) -> Result<AstNode, String> {
+        let module_alias = match consume(&mut self.tokens) {
+            Some(Token::IDENT(name)) => name.to_string(),
+            _ => return Err("Expected module alias after 'use'".into()),
+        };
+
+        // Expect `(`
+        expect(&mut self.tokens, Token::PAREN("{"));
+
+        let mut items = Vec::new();
+        loop {
+            match peek(&mut self.tokens) {
+                Some(Token::PAREN("}")) => {
+                    consume(&mut self.tokens);
+                    break;
+                }
+                Some(Token::IDENT(_)) => {
+                    let name = match consume(&mut self.tokens) {
+                        Some(Token::IDENT(n)) => n.to_string(),
+                        _ => unreachable!(),
+                    };
+                    items.push(name);
+
+                    match peek(&mut self.tokens) {
+                        Some(Token::PUNCT(",")) => { consume(&mut self.tokens); }
+                        Some(Token::PAREN("}")) => {}
+                        _ => return Err("Expected ',' or ')' in use item list".into()),
+                    }
+                }
+                _ => return Err("Unexpected token in 'use' item list".into()),
+            }
+        }
+
+        Ok(AstNode::Use { module_alias, items })
     }
 
     fn parse_conditional_branch(&mut self) -> Result<AstNode, String> {
@@ -453,7 +559,7 @@ impl Parser {
                 }
                 Some(Token::IDENT(name)) => {
                     consume(&mut self.tokens);
-                    expect(&mut self.tokens, Token::PAREN(":"));
+                    expect(&mut self.tokens, Token::PUNCT(":"));
 
                     let v_type = self.parse_type()?;
                     params.push(Parameter { ident: name.to_string(), v_type });
@@ -503,7 +609,7 @@ impl Parser {
                         loop {
                             match peek(&mut self.tokens) {
                                 Some(Token::BINOP(">")) => {
-                                    consume(&mut self.tokens); // 🔥 REQUIRED
+                                    consume(&mut self.tokens);
                                     break;
                                 }
                                 _ => {
@@ -529,10 +635,12 @@ impl Parser {
                         "i16" => VType::I16,
                         "u32" => VType::U32,
                         "i32" | "int" => VType::I32,
+                        "u64" => VType::U64,
+                        "i64" => VType::I64,
                         "f32" => VType::F32,
                         "f64" => VType::F64,
                         "empty" => VType::Empty,
-                        "function" => VType::Func,
+                        "function" => VType::Function,
                         "boolean" => VType::Bool,
                         "string" => VType::String,
                         "usize" => VType::USize,
@@ -562,7 +670,7 @@ impl Parser {
                 } 
                 else
                 {
-                    return Err(format!("Unknown type '{}'", type_name));
+                    Ok(VType::Unresolved(type_name.to_string()))
                 }
             }
             Some(Token::BINOP("&")) => {
@@ -773,25 +881,36 @@ impl Parser {
             Some(Token::IDENT(name)) => {
                 let name = name.to_string();
 
-                // Parse generics first
                 let mut generics = Vec::new();
                 if let Some(Token::BINOP("<")) = peek(&mut self.tokens) {
-                    generics = self.parse_generic_args()?;
+                    let mut clone_iter = self.tokens.clone();
+                    clone_iter.next(); // consume '<'
+                    let mut found_closing = false;
+                    while let Some(tok) = clone_iter.next() {
+                        match tok {
+                            Token::BINOP(">") => { found_closing = true; break; }
+                            Token::PUNCT(",") | Token::IDENT(_) => continue,
+                            _ => break,
+                        }
+                    }
+
+                    if found_closing {
+                        // Only treat as generic if we find a closing '>'
+                        generics = self.parse_generic_args()?;
+                    }
                 }
 
                 if let Some(Token::PAREN("{")) = peek(&mut self.tokens) {
                     return self.parse_struct_literal(name, generics);
                 }
 
-                // Otherwise just identifier (generics carried via postfix later if needed)
                 if generics.is_empty() {
                     Ok(AstNode::Identifier(name))
                 } else {
-                    // Treat as generic "value" (used later by calls)
                     Ok(AstNode::Call {
                         callee: Box::new(AstNode::Identifier(name)),
                         generics,
-                        args: vec![], // filled later
+                        args: vec![],
                     })
                 }
             }

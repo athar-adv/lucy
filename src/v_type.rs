@@ -6,14 +6,16 @@ pub enum VType {
     U16,
     I16,
     U32,
+    I64,
+    U64,
     I32,
     F32,
     F64,
     USize,
-    Func,
     Empty,
     Bool,
     String,
+    Unresolved(String),
     Struct(String, Vec<VType>), // Proto name, instantiated generics
     Function,
     Generic(String), // name
@@ -34,6 +36,8 @@ pub fn is_vtype(name: &str) -> bool {
     |   "i16"
     |   "i32"
     |   "u32"
+    |   "i64"
+    |   "u64"
     |   "f32"
     |   "f64"
     |   "empty"
@@ -55,10 +59,12 @@ pub fn vty_from_str(name: &str) -> Result<VType, String> {
         "i16" => Ok(VType::I16),
         "i32" => Ok(VType::I32),
         "u32" => Ok(VType::U32),
+        "i64" => Ok(VType::I64),
+        "u64" => Ok(VType::U64),
         "f32" => Ok(VType::F32),
         "f64" => Ok(VType::F64),
         "empty" => Ok(VType::Empty),
-        "function" => Ok(VType::Func),
+        "function" => Ok(VType::Function),
         "boolean" => Ok(VType::Bool),
         "string" => Ok(VType::String),
         "usize" => Ok(VType::USize),
@@ -93,9 +99,11 @@ impl PartialEq for VType {
             (VType::U32, VType::U32) => true,
             (VType::I32, VType::I32) => true,
             (VType::F32, VType::F32) => true,
+            (VType::I64, VType::I64) => true,
+            (VType::U64, VType::U64) => true,
             (VType::F64, VType::F64) => true,
             (VType::USize, VType::USize) => true,
-            (VType::Func, VType::Func) => true,
+            (VType::Function, VType::Function) => true,
             (VType::Empty, VType::Empty) => true,
             (VType::Bool, VType::Bool) => true,
             (VType::String, VType::String) => true,

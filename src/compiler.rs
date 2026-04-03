@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use crate::ast::{AstNode, Parameter};
 use crate::v_type::VType;
 use crate::vm::NativeFunction;
+use crate::ast::{AstNode, Parameter, Parser};
+use crate::lexer::tokenize;
 
 #[derive(Debug, Clone)]
 pub struct RegAlloc {
@@ -50,6 +51,8 @@ pub struct CompileCtx {
     pub regs: RegAlloc,
     pub native_map: HashMap<String, usize>,
     pub struct_instances: HashMap<String, usize>,
+    pub init_code: Vec<Instruction>,
+    pub const_symbols: HashMap<String, u32>, // name -> const pool index
 }
 
 macro_rules! find_const_arm {
@@ -79,12 +82,109 @@ fn substitute_type(ty: &VType, map: &HashMap<String, VType>) -> VType {
     }
 }
 
+pub struct TypeResolver<'a> {
+    pub local_structs: &'a HashMap<String, VType>,
+    pub imported_structs: &'a HashMap<String, HashMap<String, VType>>, // module_alias -> struct_name -> VType
+}
+
+impl<'a> TypeResolver<'a> {
+    pub fn resolve_node(&self, node: &mut AstNode) -> Result<(), String> {
+        match node {
+            AstNode::Declaration { v_type, .. } |
+            AstNode::StructDecl { struct_type: v_type, .. } => {
+                *v_type = self.resolve_type(v_type)?;
+            }
+            AstNode::Function { params, return_type, body, .. } => {
+                for param in params {
+                    param.v_type = self.resolve_type(&param.v_type)?;
+                }
+                *return_type = self.resolve_type(return_type)?;
+                for stmt in body {
+                    self.resolve_node(stmt)?;
+                }
+            }
+            AstNode::StructLiteral { generics, .. } => {
+                for g in generics {
+                    *g = self.resolve_type(g)?;
+                }
+            }
+            AstNode::Call { generics, callee, args } => {
+                for g in generics { *g = self.resolve_type(g)?; }
+                self.resolve_node(callee)?;
+                for arg in args { self.resolve_node(arg)?; }
+            }
+            AstNode::Assignment { assignee, value } |
+            AstNode::BinaryOp { left: assignee, right: value, .. }
+            => {
+                self.resolve_node(assignee)?;
+                self.resolve_node(value)?;
+            }
+            AstNode::TypeCast { value: assignee, ty: value } => {
+                self.resolve_node(assignee)?;
+                self.resolve_type(value)?;
+            }
+            AstNode::Return { args } => {
+                for a in args {
+                    self.resolve_node(a)?;
+                }
+            }
+            AstNode::ForLoop { params, iteratee, body } => {
+                for p in params { p.v_type = self.resolve_type(&p.v_type)?; }
+                self.resolve_node(iteratee)?;
+                for s in body { self.resolve_node(s)?; }
+            }
+            AstNode::WhileLoop { condition, body } => {
+                self.resolve_node(condition)?;
+                for s in body { self.resolve_node(s)?; }
+            }
+            AstNode::ConditionalBranch { condition, body, next } => {
+                if let Some(cond) = condition { self.resolve_node(cond)?; }
+                for s in body { self.resolve_node(s)?; }
+                if let Some(next_branch) = next { self.resolve_node(next_branch)?; }
+            }
+            AstNode::DoBlock(body) | AstNode::ArrayLiteral { exprs: body } => {
+                for s in body { self.resolve_node(s)?; }
+            }
+            AstNode::Program(body) => {
+                for s in body { self.resolve_node(s)?; }
+            }
+            _ => {} // literals, identifiers, imports, etc.
+        }
+        Ok(())
+    }
+
+    fn resolve_type(&self, ty: &VType) -> Result<VType, String> {
+        match ty {
+            VType::Unresolved(name) => {
+                if let Some(struct_type) = self.local_structs.get(name) {
+                    Ok(struct_type.clone())
+                } else {
+                    // search imports
+                    for module in self.imported_structs.values() {
+                        if let Some(struct_type) = module.get(name) {
+                            return Ok(struct_type.clone());
+                        }
+                    }
+                    Err(format!("Cannot resolve type '{}'", name))
+                }
+            }
+            VType::Struct(name, generics) => {
+                let mut resolved_generics = Vec::new();
+                for g in generics {
+                    resolved_generics.push(self.resolve_type(g)?);
+                }
+                Ok(VType::Struct(name.clone(), resolved_generics))
+            }
+            _ => Ok(ty.clone())
+        }
+    }
+}
+
 fn instantiate_struct(
     ctx: &mut CompileCtx,
     base_name: &str,
     generic_args: Vec<VType>
 ) -> usize {
-    // Build unique key
     let key = format!(
         "{}<{}>",
         base_name,
@@ -94,12 +194,9 @@ fn instantiate_struct(
             .join(",")
     );
 
-    // Cache hit
     if let Some(idx) = ctx.struct_instances.get(&key) {
         return *idx;
     }
-
-    // Find base prototype
     let base = ctx.structs.iter()
         .find(|s| s.name == base_name)
         .unwrap_or_else(|| panic!("Unknown struct '{}'", base_name))
@@ -112,26 +209,22 @@ fn instantiate_struct(
         panic!("Generic struct '{}' requires type arguments", base_name);
     }
 
-    // Build substitution map
     let subst: HashMap<_, _> = base.generics.iter()
         .cloned()
         .zip(generic_args.iter().cloned())
         .collect();
 
-    // Substitute fields
     let fields = base.fields.iter()
         .map(|(name, ty)| (name.clone(), substitute_type(ty, &subst)))
         .collect::<Vec<_>>();
 
-    // Create new prototype
     let new_proto = StructPrototype {
-        name: key.clone(), // unique name for instantiated generic
+        name: key.clone(),
         fields,
         struct_type: VType::Struct(key.clone(), vec![]),
-        generics: vec![], // concrete now
+        generics: vec![],
     };
-
-    // Push and get the correct index
+    
     let new_idx = ctx.structs.len();
     ctx.structs.push(new_proto);
     ctx.struct_instances.insert(key, new_idx);
@@ -149,6 +242,8 @@ impl CompileCtx {
             regs: RegAlloc::new(),
             native_map: HashMap::new(),
             struct_instances: HashMap::new(),
+            init_code: vec![],
+            const_symbols: HashMap::new(),
         }
     }
 
@@ -161,6 +256,8 @@ impl CompileCtx {
             regs: RegAlloc::new(),
             native_map: parent.native_map.clone(),
             struct_instances: HashMap::new(),
+            init_code: vec![],
+            const_symbols: parent.const_symbols.clone(),
         }
     }
 
@@ -180,6 +277,7 @@ impl CompileCtx {
             ConstValue::Function(idx) => find_const_arm!(self.consts, ConstValue::Function, idx),
             ConstValue::NativeFunction(idx) => find_const_arm!(self.consts, ConstValue::NativeFunction, idx),
             ConstValue::I32(i) => find_const_arm!(self.consts, ConstValue::I32, i),
+            ConstValue::U8(i) => find_const_arm!(self.consts, ConstValue::U8, i),
             ConstValue::USize(i) => find_const_arm!(self.consts, ConstValue::USize, i),
             ConstValue::Str(ref i) => find_const_arm!(self.consts, ConstValue::Str, *i),
             ConstValue::Struct(i) => find_const_arm!(self.consts, ConstValue::Struct, i),
@@ -239,6 +337,9 @@ pub enum ConstValue {
 
     U32(u32),
     I32(i32),
+    
+    U64(u64),
+    I64(i64),
 
     F32(f32),
     F64(f64),
@@ -372,8 +473,6 @@ pub fn pack_i_abc(op: Opcode, a: u32, b: u32, c: u32) -> Instruction {
 
 pub fn coerce_type(from: &VType, to: &VType, ctx: &mut CompileCtx, reg: u32, code: &mut Vec<Instruction>) {
     match (from, to) {
-        // Identity — nothing to do
-        (a, b) if a == b => {}
         (a, VType::Auto) => {
             let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
             code.push(pack_i_abx(Opcode::Cast, reg, type_const));
@@ -393,6 +492,7 @@ pub fn coerce_type(from: &VType, to: &VType, ctx: &mut CompileCtx, reg: u32, cod
          VType::U8  | VType::I8  |
          VType::U16 | VType::I16 |
          VType::U32 | VType::I32 |
+         VType::U64 | VType::I64 |
          VType::F32 | VType::F64 |
          VType::USize) => {
             let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
@@ -402,6 +502,13 @@ pub fn coerce_type(from: &VType, to: &VType, ctx: &mut CompileCtx, reg: u32, cod
 
         (VType::Array(from_elem), VType::Array(to_elem)) => {
             if from_elem != to_elem {
+                let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
+                code.push(pack_i_abx(Opcode::Cast, reg, type_const));
+            }
+        }
+
+        (VType::Struct(name, generics), VType::Struct(name2, generics2)) => {
+            if name != name2 || generics != generics2 {
                 let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
                 code.push(pack_i_abx(Opcode::Cast, reg, type_const));
             }
@@ -460,14 +567,30 @@ fn type_of(ctx: &mut CompileCtx, node: &AstNode) -> VType
             VType::Array(Box::new(first_type))
         }
         AstNode::Identifier(name) => {
+            if let Some(&cidx) = ctx.const_symbols.get(name.as_str()) {
+                return match &ctx.consts[cidx as usize] {
+                    ConstValue::U8(_)    => VType::U8,
+                    ConstValue::I8(_)    => VType::I8,
+                    ConstValue::U16(_)   => VType::U16,
+                    ConstValue::I16(_)   => VType::I16,
+                    ConstValue::U32(_)   => VType::U32,
+                    ConstValue::I32(_)   => VType::I32,
+                    ConstValue::F32(_)   => VType::F32,
+                    ConstValue::F64(_)   => VType::F64,
+                    ConstValue::USize(_) => VType::USize,
+                    ConstValue::Str(_)   => VType::String,
+                    ConstValue::Bool(_)  => VType::Bool,
+                    other => panic!("type_of: unhandled const_symbol type {:?}", other),
+                };
+            }
+            
             let sym = ctx.find_symbol(name.as_str())
-                .unwrap_or_else(|| {
-                    panic!("unknown symbol")
-                });
+                .unwrap_or_else(|| panic!("unknown symbol '{}'", name));
             sym.ty.clone()
-        },
+        }
         AstNode::BinaryOp {op, left, right} => {
             match op.as_str() {
+                "+" => type_of(ctx, left),
                 "." => {
                     let left_ty = type_of(ctx, &*left);
 
@@ -553,10 +676,13 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 let cidx = ctx.find_or_add_const(ConstValue::NativeFunction(*native_idx));
                 code.push(pack_i_abx(Opcode::LoadConst, reg, cidx));
             }
-            else {
+            else if let Some(&cidx) = ctx.const_symbols.get(&name) {
+                code.push(pack_i_abx(Opcode::LoadConst, reg, cidx));
+            }
+            else
+            {
                 let sym = ctx.find_symbol(&name)
                     .unwrap_or_else(|| panic!("Unknown identifier `{}`", name));
-
                 if sym.reg != reg {
                     code.push(pack_i_abx(Opcode::Move, reg, sym.reg));
                 }
@@ -635,21 +761,35 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
             }
         }
         AstNode::Call { callee, args, generics } => {
+            let param_types: Vec<VType> = if let AstNode::Identifier(ref name) = *callee {
+                ctx.protos.iter()
+                    .find(|p| p.name == name.as_str())
+                    .map(|p| p.params.iter().map(|param| param.v_type.clone()).collect())
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+
             code.extend(compile_expr(*callee, ctx, reg));
 
             let mut arg_regs = vec![];
             for _ in 0..args.len() {
-                let a = ctx.regs.alloc();
-                arg_regs.push(a);
-            }
-
-            for (i, arg) in args.into_iter().enumerate() {
-                let arg_reg = arg_regs[i];
-                code.extend(compile_expr(*arg, ctx, arg_reg));
+                arg_regs.push(ctx.regs.alloc());
             }
             
+            for (i, arg) in args.into_iter().enumerate() {
+                let arg_reg = arg_regs[i];
+                let arg_ty = type_of(ctx, &arg);
+                code.extend(compile_expr(*arg, ctx, arg_reg));
+
+                if let Some(param_ty) = param_types.get(i) {
+                    //if &arg_ty != param_ty {
+                        coerce_type(&arg_ty, param_ty, ctx, arg_reg, &mut code);
+                    //}
+                }
+            }
+
             let num_args = arg_regs.len() as u32;
-            // Convention: CALL A Bx -> function in R[A], args in R[A+1 .. A+Bx], returns into R[A]
             code.push(pack_i_abx(Opcode::Call, reg, num_args));
         }
         AstNode::StructLiteral { name, fields, generics } => {
@@ -672,7 +812,7 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 field_regs.push(a);
             }
             let mut field_idcs = vec![];
-            println!("{}, {:?}", name, struct_proto.fields);
+
             for (i, (field_name, ..)) in fields.iter().enumerate() {
                 let field_idx = struct_proto.fields.iter()
                     .position(|(fname, _)| fname == field_name)
@@ -694,16 +834,11 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 panic!("Array literal must have at least one element (cannot infer element type from empty literal)");
             }
 
-            // Infer element type from the first element; all others must match or be
-            // coercible to it.
             let elem_type = type_of(ctx, &exprs[0]);
             let len = exprs.len();
 
-            // Allocate registers for all elements up-front (mirrors the Call convention).
             let mut elem_regs: Vec<u32> = (0..len).map(|_| ctx.regs.alloc()).collect();
 
-            // Emit a NewArray instruction: A = destination reg, Bx = const-pool index
-            // for an Array(elem_type, len) descriptor.
             let array_type_const =
                 ctx.find_or_add_const(
                     ConstValue::Array(
@@ -722,11 +857,11 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 code.extend(compile_expr(*expr, ctx, elem_reg));
 
                 // Coerce the element to the array's canonical element type if needed.
-                if expr_type != elem_type {
+                //if expr_type != elem_type {
                     let mut coerce_code = vec![];
                     coerce_type(&expr_type, &elem_type, ctx, elem_reg, &mut coerce_code);
                     code.extend(coerce_code);
-                }
+                //}
 
                 // Emit the index constant and the SetArrayIdx instruction.
                 let idx_const = ctx.find_or_add_const(ConstValue::USize(i));
@@ -762,6 +897,25 @@ fn resolve_field_access(node: &AstNode, ctx: &CompileCtx, struct_reg: &u32) -> u
 
 pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instruction>) {
     match ast {
+        AstNode::Export { item } => {
+            // Compile the inner item normally — the export flag is metadata
+            // for your module linker/loader to handle at a higher level.
+            // Mark it in ctx if you want runtime export tracking later.
+            compile_stmt(*item, ctx, code);
+        }
+
+        AstNode::Import { alias, path } => {
+            // Resolution happens before compilation (in a module loader).
+            // At compile time, just register the alias as a known namespace
+            // so `use` statements can reference it. No code emitted.
+        }
+
+        AstNode::Use { module_alias, items } => {
+            // At compile time, the module loader should have already merged
+            // exported symbols from `module_alias` into scope. 
+            // If you're doing single-pass compilation, this is a no-op here
+            // and the loader handles symbol injection before compile_stmt runs.
+        }
         AstNode::Assignment { assignee, value } => {
             match *assignee {
                 AstNode::Identifier(name) => {
@@ -817,12 +971,10 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
                 let reg = ctx.regs.alloc();
                 ctx.add_symbol(name_str.clone(), reg, v_type.clone());
                 code.extend(compile_expr(*value, ctx, reg));
-                
-                if t != v_type {
-                    // Attempt coercion — coerce_type will panic with a descriptive
-                    // message if the types are genuinely incompatible.
+
+                //if t != v_type {
                     coerce_type(&t, &v_type, ctx, reg, code);
-                }
+                //}
             } else {
                 panic!("Declaration: expected identifier as binding name, got {:?}", name);
             }
@@ -859,16 +1011,17 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
                 func_ctx.add_symbol(param.ident.clone(), reg, param.v_type.clone());
             }
 
+            let proto_idx = ctx.protos.len();
+            let reg = ctx.regs.alloc();
+            
+            ctx.add_symbol(name.clone(), reg, VType::Function);
+            ctx.add_const(ConstValue::Function(proto_idx));
+
             let mut func_code = vec![];
             for stmt in body {
                compile_stmt(*stmt, &mut func_ctx, &mut func_code);
             }
 
-            let proto_idx = ctx.protos.len();
-            let reg = ctx.regs.alloc();
-            ctx.add_symbol(name.clone(), reg, VType::Function);
-            ctx.add_const(ConstValue::Function(proto_idx));
-            
             let proto = PrototypeFunction {
                 name: name.clone(),
                 params: params,
@@ -1142,4 +1295,237 @@ fn compile_field_access_chain(left: AstNode, right: AstNode, ctx: &mut CompileCt
     collect_field_indices(&right, &mut field_indices, ctx);
     
     (struct_reg, field_indices)
+}
+
+pub fn resolve_import_exports<F>(
+    program: &mut AstNode,
+    ctx: &mut CompileCtx,
+    read_file: F,
+) -> Result<(), String>
+where
+    F: Fn(&str) -> Result<String, String>,
+{
+    let nodes = match program {
+        AstNode::Program(nodes) => nodes,
+        _ => return Err("resolve_import_exports: expected AstNode::Program".into()),
+    };
+
+    let mut imports: Vec<(String, String)> = vec![];
+    let mut uses: Vec<(String, Vec<String>)> = vec![];
+
+    for node in nodes.iter() {
+        match node {
+            AstNode::Import { alias, path } => imports.push((alias.clone(), path.clone())),
+            AstNode::Use { module_alias, items } => uses.push((module_alias.clone(), items.clone())),
+            _ => {}
+        }
+    }
+
+    let mut module_exports: HashMap<String, Vec<(String, AstNode)>> = HashMap::new();
+
+    for (alias, path) in &imports {
+        let src = read_file(path)
+            .map_err(|e| format!("import '{}': could not read file: {}", path, e))?;
+
+        let tokens = tokenize(src);
+        let module_ast = Parser::new(tokens)
+            .parse()
+            .map_err(|e| format!("import '{}': parse error: {}", path, e))?;
+
+        let exported = collect_module_exports(module_ast)?;
+
+        for (name, node) in &exported {
+            let ns_name = format!("{}::{}", alias, name);
+            inject_export_into_ctx(ctx, node.clone(), &ns_name)?;
+        }
+
+        module_exports.insert(alias.clone(), exported);
+    }
+
+    for (module_alias, requested_items) in &uses {
+        let exports = module_exports.get(module_alias).ok_or_else(|| {
+            format!("`use {}`: no `import` with that alias found", module_alias)
+        })?;
+
+        for item_name in requested_items {
+            let (_, item_node) = exports.iter()
+                .find(|(name, _)| name == item_name)
+                .ok_or_else(|| format!(
+                    "`use {}::({})`: '{}' was not exported by that module",
+                    module_alias, item_name, item_name
+                ))?;
+
+            inject_export_into_ctx(ctx, item_node.clone(), item_name)?;
+        }
+    }
+
+    resolve_all_unresolved_types(program, ctx)?;
+
+    Ok(())
+}
+
+fn resolve_all_unresolved_types(node: &mut AstNode, ctx: &CompileCtx) -> Result<(), String> {
+    match node {
+        AstNode::Program(nodes) => {
+            for n in nodes.iter_mut() { resolve_all_unresolved_types(n, ctx)?; }
+        }
+        AstNode::Function { params, return_type, body, .. } => {
+            for param in params { param.v_type = resolve_type_in_ctx(&param.v_type, ctx)?; }
+            *return_type = resolve_type_in_ctx(return_type, ctx)?;
+            for stmt in body { resolve_all_unresolved_types(stmt, ctx)?; }
+        }
+        AstNode::Declaration { v_type, .. } => {
+            *v_type = resolve_type_in_ctx(v_type, ctx)?;
+        }
+        AstNode::StructDecl { fields, .. } => {
+            for param in fields.iter_mut() {
+                param.v_type = resolve_type_in_ctx(&param.v_type, ctx)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn resolve_type_in_ctx(ty: &VType, ctx: &CompileCtx) -> Result<VType, String> {
+    match ty {
+        VType::Unresolved(full_name) => {
+            let parts: Vec<_> = full_name.split("::").collect();
+            let name = if parts.len() == 2 { parts[1] } else { full_name.as_str() };
+
+            for s in &ctx.structs {
+                if s.name == *full_name {
+                    return Ok(VType::Struct(full_name.to_string(), vec![]));
+                }
+            }
+
+            Err(format!("resolve_type_in_ctx: cannot resolve '{}'", full_name))
+        }
+        VType::Struct(name, generics) => {
+            let resolved_generics: Result<Vec<_>, _> =
+                generics.iter().map(|g| resolve_type_in_ctx(g, ctx)).collect();
+            Ok(VType::Struct(name.clone(), resolved_generics?))
+        }
+        _ => Ok(ty.clone()),
+    }
+}
+
+fn collect_module_exports(program: AstNode) -> Result<Vec<(String, AstNode)>, String> {
+    let nodes = match program {
+        AstNode::Program(nodes) => nodes,
+        _ => return Err("collect_module_exports: expected Program node".into()),
+    };
+
+    let mut out = Vec::new();
+    for node in nodes {
+        if let AstNode::Export { item } = node {
+            let name = export_name(&item)
+                .ok_or_else(|| format!("exported item has no retrievable name: {:?}", item))?;
+            out.push((name, *item));
+        }
+    }
+
+    Ok(out)
+}
+
+fn export_name(node: &AstNode) -> Option<String> {
+    match node {
+        AstNode::Function { name, .. } => Some(name.clone()),
+        AstNode::StructDecl { name, .. } => Some(name.clone()),
+        AstNode::Declaration { name, .. } => {
+            if let AstNode::Identifier(n) = name.as_ref() { Some(n.clone()) } else { None }
+        }
+        _ => None,
+    }
+}
+
+fn inject_export_into_ctx(ctx: &mut CompileCtx, node: AstNode, name: &str) -> Result<(), String> {
+    match node {
+        AstNode::Function { params, body, return_type, .. } => {
+            if ctx.find_fn_addr_by_name(name).is_some() { return Ok(()); }
+
+            let mut func_ctx = CompileCtx::with_parent(ctx);
+            for param in &params {
+                let reg = func_ctx.regs.alloc();
+                func_ctx.add_symbol(param.ident.clone(), reg, param.v_type.clone());
+            }
+
+            let mut func_code = vec![];
+            for stmt in body { compile_stmt(*stmt, &mut func_ctx, &mut func_code); }
+
+            let proto_idx = ctx.protos.len();
+            let reg = ctx.regs.alloc();
+            ctx.add_symbol(name.to_string(), reg, VType::Function);
+            ctx.find_or_add_const(ConstValue::Function(proto_idx));
+            ctx.protos.push(PrototypeFunction {
+                name: name.to_string(),
+                params,
+                code: func_code,
+                ctx: func_ctx,
+                return_type,
+            });
+        }
+
+        AstNode::StructDecl { fields, struct_type, generics, .. } => {
+            if ctx.structs.iter().any(|s| s.name == name) { return Ok(()); }
+
+            let struct_idx = ctx.structs.len();
+            let reg = ctx.regs.alloc();
+            ctx.add_symbol(name.to_string(), reg, VType::Struct(name.to_string(), vec![]));
+            ctx.add_const(ConstValue::Struct(struct_idx));
+            ctx.structs.push(StructPrototype {
+                name: name.to_string(),
+                fields: fields.into_iter().map(|p| (p.ident, p.v_type)).collect(),
+                struct_type,
+                generics,
+            });
+        }
+
+        AstNode::Declaration { value, v_type, .. } => {
+            if ctx.const_symbols.contains_key(name) { return Ok(()); }
+
+            let inferred_ty = type_of(ctx, &value);
+            let temp_reg = ctx.regs.alloc();
+            let mut temp_code = vec![];
+            temp_code.extend(compile_expr(*value, ctx, temp_reg));
+
+            let resolved_ty = if v_type == VType::Auto { inferred_ty.clone() } else { v_type.clone() };
+            coerce_type(&inferred_ty, &resolved_ty, ctx, temp_reg, &mut temp_code);
+
+            let final_idx = match resolved_ty {
+                VType::U8   => ctx.find_or_add_const(ConstValue::U8(extract_i32(&ctx, temp_code[0]) as u8)),
+                VType::I8   => ctx.find_or_add_const(ConstValue::I8(extract_i32(&ctx, temp_code[0]) as i8)),
+                VType::U16  => ctx.find_or_add_const(ConstValue::U16(extract_i32(&ctx, temp_code[0]) as u16)),
+                VType::I16  => ctx.find_or_add_const(ConstValue::I16(extract_i32(&ctx, temp_code[0]) as i16)),
+                VType::U32  => ctx.find_or_add_const(ConstValue::U32(extract_i32(&ctx, temp_code[0]) as u32)),
+                VType::I32  => ctx.find_or_add_const(ConstValue::I32(extract_i32(&ctx, temp_code[0]))),
+                VType::F32  => ctx.find_or_add_const(ConstValue::F32(extract_i32(&ctx, temp_code[0]) as f32)),
+                VType::F64  => ctx.find_or_add_const(ConstValue::F64(extract_i32(&ctx, temp_code[0]) as f64)),
+                VType::USize => ctx.find_or_add_const(ConstValue::USize(extract_i32(&ctx, temp_code[0]) as usize)),
+                _ => { let bx = temp_code[0] >> B_SHIFT; bx }
+            };
+
+            ctx.const_symbols.insert(name.to_string(), final_idx);
+        }
+
+        other => return Err(format!("inject_export_into_ctx: unsupported export kind: {:?}", other)),
+    }
+
+    Ok(())
+}
+
+fn extract_i32(ctx: &CompileCtx, load_const_instr: Instruction) -> i32 {
+    let bx = load_const_instr >> B_SHIFT;
+    match &ctx.consts[bx as usize] {
+        ConstValue::I32(n) => *n,
+        ConstValue::U8(n)  => *n as i32,
+        ConstValue::I8(n)  => *n as i32,
+        ConstValue::U16(n) => *n as i32,
+        ConstValue::I16(n) => *n as i32,
+        ConstValue::U32(n) => *n as i32,
+        ConstValue::F32(n) => *n as i32,
+        ConstValue::F64(n) => *n as i32,
+        ConstValue::USize(n) => *n as i32,
+        other => panic!("extract_i32: unexpected const {:?}", other),
+    }
 }
