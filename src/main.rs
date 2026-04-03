@@ -192,10 +192,13 @@ fn dump_protos(ctx: &CompileCtx) {
 
 fn main() {
     use std::{fs, process};
-    let contents = match fs::read_to_string("./input.ath") {
+    let mut args = env::args();
+    let path = args.next().unwrap();
+
+    let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(e) => {
-            eprintln!("Error reading file '{}': {}", "./input.ath", e);
+            eprintln!("Error reading file '{}': {}", &path, e);
             process::exit(1);
         }
     };
